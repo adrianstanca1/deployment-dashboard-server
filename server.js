@@ -3526,8 +3526,42 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     const useProvider = provider || activeProvider;
     const config = LLM_CONFIG[useProvider];
 
-    // Generate contextual response based on capability
-    const response = generateAIResponse(message, context, capability);
+    let response = null;
+    let toolInfo = null;
+
+    // Try Claude with tools for Anthropic provider
+    if (useProvider === 'anthropic' && ANTHROPIC_API_KEY) {
+      const result = await processWithTools(message, context);
+      if (result) {
+        response = result.response;
+        toolInfo = { calls: result.tools || 0 };
+      }
+    }
+
+    // Fall back to rule-based response
+    if (!response) {
+      // Check for simple function name - try to execute it directly
+      const lowerMsg = message.toLowerCase().trim();
+      if (lowerMsg.startsWith('pm2 ') || lowerMsg.startsWith('git ') || lowerMsg.startsWith('file ')) {
+        const parts = lowerMsg.split(' ');
+        const func = parts[0];
+        const args = parts.slice(1).join(' ');
+        if (func === 'pm2' && parts[1] === 'list') {
+          const r = await executeTool('pm2_list', {});
+          response = r.success ? `PM2 Processes:\n${r.processes?.map(p => `• ${p.name}: ${p.status} (CPU: ${p.cpu}%, Mem: ${Math.round(p.memory/1024/1024)}MB)`).join('\n') || 'None'}` : r.error;
+        } else if (func === 'git' && parts[1] === 'status') {
+          const r = await executeTool('git_status', { path: args || '/root' });
+          response = r.success ? `Git Status: ${r.branch}\n${r.files?.map(f => `${f.status} ${f.file}`).join('\n') || 'Clean'}` : r.error;
+        } else if (func === 'system' && parts[1] === 'stats') {
+          const r = await executeTool('system_stats', {});
+          response = r.success ? `System Stats:\nCPU: ${r.cpu?.usage}%\nMemory: ${r.memory?.percentage}%\nDisk: ${r.disk?.percentage}%` : r.error;
+        }
+      }
+
+      if (!response) {
+        response = generateIntelligentResponse(message, context);
+      }
+    }
 
     res.json({
       success: true,
@@ -3536,6 +3570,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       model: model || config?.defaultModel,
       capability,
       actions: generateAIActions(message, context, capability),
+      toolInfo
     });
   } catch (error) {
     console.error('[AI] Error:', error);
@@ -3902,6 +3937,84 @@ app.get('*', (req, res, next) => {
 // ============================================================================
 // START
 // ============================================================================
+
+// ============================================================================
+// AI TOOL PROCESSING
+// ============================================================================
+
+async function processWithTools(message, context) {
+  if (!ANTHROPIC_API_KEY) return null;
+
+  const systemPrompt = `You are a DevOps Assistant with tools to manage the server.
+
+Current Status:
+- PM2: ${context?.pm2?.online || 0}/${context?.pm2?.total || 0} online
+- CPU: ${context?.system?.cpu || 0}%
+
+Use tools when the user asks about server status, logs, files, git, or wants to restart services.`;
+
+  const messages = [{ role: 'user', content: message }];
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages,
+        tools: SERVER_TOOLS,
+        tool_choice: { type: 'auto' }
+      })
+    });
+
+    if (!response.ok) return null;
+
+    const result = await response.json();
+    const toolCalls = result.content?.filter(c => c.type === 'tool_use') || [];
+
+    if (toolCalls.length > 0) {
+      const toolResults = [];
+      for (const tc of toolCalls) {
+        console.log(`[AI Tool] ${tc.name}:`, tc.input);
+        const tr = await executeTool(tc.name, tc.input);
+        toolResults.push({ type: 'tool_result', tool_use_id: tc.id, content: JSON.stringify(tr, null, 2) });
+      }
+
+      messages.push({ role: 'assistant', content: result.content });
+      messages.push({ role: 'user', content: toolResults });
+
+      const final = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, system: systemPrompt, messages })
+      });
+
+      if (!final.ok) return { response: result.content[0]?.text, tools: toolCalls.length };
+      const fr = await final.json();
+      return { response: fr.content[0]?.text, tools: toolCalls.length };
+    }
+
+    return { response: result.content[0]?.text };
+  } catch (error) {
+    console.error('[Tool Error]:', error.message);
+    return null;
+  }
+}
+
+// Get available tools list
+app.get('/api/ai/tools', (req, res) => {
+  res.json({ success: true, tools: SERVER_TOOLS });
+});
 
 const PORT = process.env.DASHBOARD_API_PORT || 3999;
 server.listen(PORT, () => {
