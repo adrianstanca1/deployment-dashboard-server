@@ -21,6 +21,12 @@ try { pty = require('node-pty'); } catch (e) { console.warn('node-pty not availa
 const jwt = require('jsonwebtoken');
 const execAsync = util.promisify(exec);
 
+// AI Tools
+const { SERVER_TOOLS } = require('./server-tools');
+const { executeTool } = require('./server-tool-executor');
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
 // ============================================================================
 // AUTH CONFIG
 // ============================================================================
