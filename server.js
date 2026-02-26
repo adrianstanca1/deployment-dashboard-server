@@ -216,9 +216,11 @@ app.get('/api/auth/me', (req, res) => {
   }
 });
 
-// ── Global API auth guard (all /api/* except /api/auth/*) ───────────────────
+// ── Global API auth guard (all /api/* except /api/auth/* and /api/ai/* for tools/providers) ───────────────────
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/') || req.path.startsWith('/api/auth/')) return next();
+  if (!req.path.startsWith('/api/')) return next();
+  if (req.path.startsWith('/api/auth/')) return next();
+  if (req.path.startsWith('/api/ai/providers') || req.path.startsWith('/api/ai/tools') || req.path.startsWith('/api/ai/capabilities') || req.path.startsWith('/api/ai/agents')) return next();
   requireAuth(req, res, next);
 });
 
@@ -3538,6 +3540,21 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       }
     }
 
+    // Try OpenAI with tools for OpenAI provider
+    if (useProvider === 'openai' && LLM_CONFIG.openai.apiKey) {
+      const result = await processWithOpenAI(message, context);
+      if (result) {
+        response = result.response;
+        toolInfo = { calls: result.tools || 0 };
+      }
+    }
+
+    // Try local Ollama (limited tool support)
+    if (useProvider === 'local') {
+      // Ollama doesn't support function calling natively, use rule-based
+      response = generateIntelligentResponse(message, context);
+    }
+
     // Fall back to rule-based response
     if (!response) {
       // Check for simple function name - try to execute it directly
@@ -4014,6 +4031,217 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
 // Get available tools list
 app.get('/api/ai/tools', (req, res) => {
   res.json({ success: true, tools: SERVER_TOOLS });
+});
+
+// Convert Claude tools to OpenAI format
+function convertToolsToOpenAI(tools) {
+  return tools.map(tool => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.input_schema
+    }
+  }));
+}
+
+// Process with OpenAI function calling
+async function processWithOpenAI(message, context) {
+  const openaiKey = LLM_CONFIG.openai.apiKey;
+  if (!openaiKey) return null;
+
+  const systemPrompt = `You are a DevOps Assistant with tools to manage the server. Use tools when the user asks about server status, logs, files, git, or wants to restart services.`;
+
+  try {
+    // First call with tools
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4-turbo-preview',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: message }
+        ],
+        tools: convertToolsToOpenAI(SERVER_TOOLS),
+        tool_choice: 'auto'
+      })
+    });
+
+    if (!response.ok) return null;
+    const result = await response.json();
+    const toolCalls = result.choices?.[0]?.message?.tool_calls || [];
+
+    if (toolCalls.length > 0) {
+      const toolResults = [];
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+        { role: 'assistant', content: null, tool_calls: toolCalls }
+      ];
+
+      for (const tc of toolCalls) {
+        console.log(`[OpenAI Tool] ${tc.function.name}:`, tc.function.arguments);
+        const args = JSON.parse(tc.function.arguments || '{}');
+        const tr = await executeTool(tc.function.name, args);
+        toolResults.push({
+          tool_call_id: tc.id,
+          role: 'tool',
+          content: JSON.stringify(tr, null, 2)
+        });
+      }
+
+      messages.push(...toolResults);
+
+      // Second call with results
+      const final = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4-turbo-preview',
+          messages
+        })
+      });
+
+      if (!final.ok) return { response: result.choices[0]?.message?.content, tools: toolCalls.length };
+      const fr = await final.json();
+      return { response: fr.choices[0]?.message?.content, tools: toolCalls.length };
+    }
+
+    return { response: result.choices[0]?.message?.content };
+  } catch (error) {
+    console.error('[OpenAI Tool Error]:', error.message);
+    return null;
+  }
+}
+
+// API Key Management
+const API_KEYS = {
+  openai: process.env.OPENAI_API_KEY || '',
+  anthropic: process.env.ANTHROPIC_API_KEY || '',
+  google: process.env.GOOGLE_API_KEY || '',
+  ollama: process.env.OLLAMA_URL || 'http://localhost:11434',
+};
+
+// Get all API keys status
+app.get('/api/ai/keys', requireAuth, (req, res) => {
+  res.json({
+    success: true,
+    keys: {
+      openai: { configured: !!API_KEYS.openai, envVar: 'OPENAI_API_KEY' },
+      anthropic: { configured: !!API_KEYS.anthropic, envVar: 'ANTHROPIC_API_KEY' },
+      google: { configured: !!API_KEYS.google, envVar: 'GOOGLE_API_KEY' },
+      ollama: { configured: !!API_KEYS.ollama, envVar: 'OLLAMA_URL', value: API_KEYS.ollama }
+    }
+  });
+});
+
+// Update API key (runtime - stored in memory only)
+app.post('/api/ai/keys', requireAuth, (req, res) => {
+  const { provider, apiKey, baseURL } = req.body;
+
+  if (!provider || !API_KEYS.hasOwnProperty(provider)) {
+    return res.status(400).json({ success: false, error: 'Invalid provider' });
+  }
+
+  if (apiKey !== undefined) {
+    API_KEYS[provider] = apiKey;
+    if (provider === 'openai') LLM_CONFIG.openai.apiKey = apiKey;
+    if (provider === 'anthropic') LLM_CONFIG.anthropic.apiKey = apiKey;
+    if (provider === 'google') LLM_CONFIG.google.apiKey = apiKey;
+  }
+
+  if (baseURL !== undefined) {
+    if (provider === 'ollama') {
+      API_KEYS.ollama = baseURL;
+      LLM_CONFIG.local.baseURL = baseURL;
+    }
+  }
+
+  res.json({ success: true, message: `${provider} API key updated` });
+});
+
+// Get server capabilities for agent delegation
+app.get('/api/ai/agents', (req, res) => {
+  res.json({
+    success: true,
+    agents: [
+      { id: 'pm2-manager', name: 'PM2 Manager', description: 'Manage PM2 processes', tools: ['pm2_list', 'pm2_restart', 'pm2_stop', 'pm2_logs'] },
+      { id: 'git-manager', name: 'Git Manager', description: 'Git operations', tools: ['git_status', 'git_pull', 'git_commit', 'git_branch_list'] },
+      { id: 'docker-manager', name: 'Docker Manager', description: 'Container management', tools: ['docker_list', 'docker_stats'] },
+      { id: 'file-manager', name: 'File Manager', description: 'File operations', tools: ['file_read', 'file_write', 'file_list', 'file_search'] },
+      { id: 'system-monitor', name: 'System Monitor', description: 'System monitoring', tools: ['system_stats', 'check_url', 'send_alert'] },
+      { id: 'db-manager', name: 'Database Manager', description: 'Database operations', tools: ['db_list', 'db_query', 'db_backup'] }
+    ]
+  });
+});
+
+// Delegate task to sub-agent
+app.post('/api/ai/delegate', requireAuth, async (req, res) => {
+  const { agentId, task, context } = req.body;
+
+  if (!agentId || !task) {
+    return res.status(400).json({ success: false, error: 'Agent ID and task required' });
+  }
+
+  const AGENT_PROMPTS = {
+    'pm2-manager': `You are a PM2 process manager. Only use these tools: pm2_list, pm2_restart, pm2_stop, pm2_logs. ${task}`,
+    'git-manager': `You are a Git manager. Only use these tools: git_status, git_pull, git_commit, git_branch_list. ${task}`,
+    'docker-manager': `You are a Docker manager. Only use these tools: docker_list, docker_stats. ${task}`,
+    'file-manager': `You are a file manager. Only use these tools: file_read, file_write, file_list, file_search. ${task}`,
+    'system-monitor': `You are a system monitor. Only use these tools: system_stats, check_url, send_alert. ${task}`,
+    'db-manager': `You are a database manager. Only use these tools: db_list, db_query, db_backup. ${task}`
+  };
+
+  const prompt = AGENT_PROMPTS[agentId];
+  if (!prompt) {
+    return res.status(400).json({ success: false, error: 'Unknown agent' });
+  }
+
+  try {
+    // Use Claude with limited tools
+    const tools = SERVER_TOOLS.filter(t => {
+      const agentTools = AGENT_PROMPTS[agentId].match(/(\w+)/g);
+      return agentTools?.includes(t.name);
+    });
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4096,
+        system: prompt,
+        messages: [{ role: 'user', content: task }],
+        tools: tools.length ? tools : undefined,
+        tool_choice: tools.length ? { type: 'auto' } : undefined
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json();
+      return res.status(500).json({ success: false, error: err.error?.message || 'Agent failed' });
+    }
+
+    const result = await response.json();
+    res.json({
+      success: true,
+      response: result.content?.[0]?.text,
+      agent: agentId
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 const PORT = process.env.DASHBOARD_API_PORT || 3999;
