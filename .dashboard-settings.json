@@ -1,0 +1,11 @@
+{
+  "security": {
+    "dashboardUser": "admin"
+  },
+  "_lastModified": "2026-02-26T07:28:32.388Z",
+  "_modifiedBy": "admin",
+  "_version": 2,
+  "general": {
+    "allowDirectPortUrls": true
+  }
+}
