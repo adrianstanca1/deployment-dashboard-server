@@ -5,3 +5,5 @@ node_modules/
 
 # Git worktrees
 .worktrees/
+.env.production
+.env*
