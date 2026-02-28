@@ -498,7 +498,8 @@ async function githubFetch(url) {
 
 app.get('/api/github/repos', async (req, res) => {
   try {
-    const repos = await githubFetch(`https://api.github.com/users/${GITHUB_USERNAME}/repos?per_page=100&sort=pushed`);
+    // Use /user/repos (authenticated) to include private repositories
+    const repos = await githubFetch(`https://api.github.com/user/repos?per_page=100&sort=pushed&type=all`);
     res.json({ success: true, data: repos });
   } catch (error) {
     res.json({ success: false, error: error.message });
@@ -4044,24 +4045,52 @@ const API_KEYS = {
   ollama: process.env.OLLAMA_URL || 'http://localhost:11434',
 };
 
+const ENV_VAR_MAP = {
+  openai: 'OPENAI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+  google: 'GOOGLE_API_KEY',
+  ollama: 'OLLAMA_URL',
+};
+
+// Persist a key to the .env file so it survives PM2 restarts
+function persistKeyToEnv(envVar, value) {
+  const envPath = path.join(__dirname, '.env');
+  let content = '';
+  try { content = fs.readFileSync(envPath, 'utf8'); } catch {}
+  const lines = content.split('\n');
+  const idx = lines.findIndex(l => l.startsWith(`${envVar}=`));
+  if (idx >= 0) {
+    lines[idx] = `${envVar}=${value}`;
+  } else {
+    lines.push(`${envVar}=${value}`);
+  }
+  fs.writeFileSync(envPath, lines.filter((_, i) => i === lines.length - 1 ? true : true).join('\n'));
+}
+
+// Mask API key for display (show last 4 chars only)
+function maskKey(key) {
+  if (!key || key.length < 8) return key;
+  return `${'*'.repeat(key.length - 4)}${key.slice(-4)}`;
+}
+
 // Get all API keys status
 app.get('/api/ai/keys', requireAuth, (req, res) => {
   res.json({
     success: true,
     keys: {
-      openai: { configured: !!API_KEYS.openai, envVar: 'OPENAI_API_KEY' },
-      anthropic: { configured: !!API_KEYS.anthropic, envVar: 'ANTHROPIC_API_KEY' },
-      google: { configured: !!API_KEYS.google, envVar: 'GOOGLE_API_KEY' },
+      openai: { configured: !!API_KEYS.openai, envVar: 'OPENAI_API_KEY', value: maskKey(API_KEYS.openai) },
+      anthropic: { configured: !!API_KEYS.anthropic, envVar: 'ANTHROPIC_API_KEY', value: maskKey(API_KEYS.anthropic) },
+      google: { configured: !!API_KEYS.google, envVar: 'GOOGLE_API_KEY', value: maskKey(API_KEYS.google) },
       ollama: { configured: !!API_KEYS.ollama, envVar: 'OLLAMA_URL', value: API_KEYS.ollama }
     }
   });
 });
 
-// Update API key (runtime - stored in memory only)
+// Update API key — persists to .env for survival across restarts
 app.post('/api/ai/keys', requireAuth, (req, res) => {
   const { provider, apiKey, baseURL } = req.body;
 
-  if (!provider || !API_KEYS.hasOwnProperty(provider)) {
+  if (!provider || !Object.prototype.hasOwnProperty.call(API_KEYS, provider)) {
     return res.status(400).json({ success: false, error: 'Invalid provider' });
   }
 
@@ -4070,16 +4099,16 @@ app.post('/api/ai/keys', requireAuth, (req, res) => {
     if (provider === 'openai') LLM_CONFIG.openai.apiKey = apiKey;
     if (provider === 'anthropic') LLM_CONFIG.anthropic.apiKey = apiKey;
     if (provider === 'google') LLM_CONFIG.google.apiKey = apiKey;
+    persistKeyToEnv(ENV_VAR_MAP[provider], apiKey);
   }
 
-  if (baseURL !== undefined) {
-    if (provider === 'ollama') {
-      API_KEYS.ollama = baseURL;
-      LLM_CONFIG.local.baseURL = baseURL;
-    }
+  if (baseURL !== undefined && provider === 'ollama') {
+    API_KEYS.ollama = baseURL;
+    LLM_CONFIG.local.baseURL = baseURL;
+    persistKeyToEnv('OLLAMA_URL', baseURL);
   }
 
-  res.json({ success: true, message: `${provider} API key updated` });
+  res.json({ success: true, message: `${provider} API key updated and persisted` });
 });
 
 // Get server capabilities for agent delegation
