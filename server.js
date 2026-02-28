@@ -148,6 +148,7 @@ function requireAuth(req, res, next) {
 }
 
 const app = express();
+app.set('trust proxy', 1); // Trust Nginx reverse proxy (needed for rate limiting behind proxy)
 const server = http.createServer(app);
 
 // ============================================================================
