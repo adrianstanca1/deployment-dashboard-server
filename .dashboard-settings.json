@@ -1,11 +1,19 @@
 {
-  "security": {
-    "dashboardUser": "admin"
+  "user": "admin",
+  "password": "admin123",
+  "jwtSecret": "super-secret-jwt-key-deploy-hub-2024",
+  "port": 3999,
+  "cors": {
+    "enabled": true,
+    "origin": "*"
   },
-  "_lastModified": "2026-02-26T07:28:32.388Z",
-  "_modifiedBy": "admin",
-  "_version": 2,
-  "general": {
-    "allowDirectPortUrls": true
+  "api": {
+    "prefix": "/api",
+    "rateLimit": 100
+  },
+  "websocket": {
+    "enabled": true,
+    "path": "/ws",
+    "heartbeat": 30000
   }
 }

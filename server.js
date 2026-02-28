@@ -4,6 +4,8 @@
  */
 
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const { exec, spawn } = require('child_process');
 const util = require('util');
@@ -185,6 +187,16 @@ server.on('upgrade', (request, socket, head) => {
     socket.destroy();
   }
 });
+
+app.use(helmet());
+
+// Global rate limiter - protects against DDoS, brute force, excessive API usage
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { success: false, error: 'Too many requests, please try again later.' }
+});
+app.use(limiter);
 
 app.use(cors());
 app.use(express.json());
@@ -1719,6 +1731,11 @@ async function collectSystemStats() {
   }
 }
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ success: true, status: 'healthy', timestamp: new Date().toISOString() });
+});
+
 app.get('/api/system/stats', async (req, res) => {
   try {
     const stats = await collectSystemStats();
@@ -2148,43 +2165,6 @@ Or tell me: "Deploy my-website on port 3005" and I'll do the rest!`;
   return `💡 **How can I help?**\n\nI can help you with:\n\n**Monitoring:**\n• Check server health and status\n• View running applications\n• Monitor resource usage\n\n**Deployment:**\n• Deploy new projects from GitHub\n• Configure applications\n• Set up reverse proxy\n\n**Troubleshooting:**\n• Fix crashed applications\n• Analyze error logs\n• Optimize performance\n\n**Management:**\n• Start/stop/restart applications\n• Clean up disk space\n• Update dependencies\n\nJust ask me in plain English! For example:\n• "Check my server health"\n• "Deploy my-website on port 3005"\n• "Fix all errors"\n• "What\'s using the most memory?"`;
 }
 
-// AI Chat endpoint
-app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const { message, context, history } = req.body;
-
-    if (!message) {
-      return res.status(400).json({ success: false, error: 'Message required' });
-    }
-
-    // Try local LLM first if enabled
-    let response;
-    if (USE_LOCAL_LLM) {
-      const llmAvailable = await checkLLMAvailability();
-      if (llmAvailable) {
-        try {
-          response = await queryLocalLLM(message, context);
-        } catch (err) {
-          console.log('LLM query failed, using fallback:', err.message);
-          response = generateIntelligentResponse(message, context);
-        }
-      } else {
-        response = generateIntelligentResponse(message, context);
-      }
-    } else {
-      response = generateIntelligentResponse(message, context);
-    }
-
-    res.json({
-      success: true,
-      response,
-      actions: generateSuggestedActions(message, context)
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 /**
  * Generate suggested actions based on user intent
  */
@@ -2235,84 +2215,6 @@ function generateSuggestedActions(message, context) {
 
   return actions;
 }
-
-// ============================================================================
-// AI ASSISTANT - LLM Integration
-// ============================================================================
-
-// Configuration for LLM endpoint
-const LLM_API_URL = process.env.LLM_API_URL || 'http://localhost:11434/api/generate';
-const LLM_MODEL = process.env.LLM_MODEL || 'codellama';
-
-// AI Chat endpoint with intelligent fallback
-app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const { message, context, history } = req.body;
-
-    if (!message) {
-      return res.json({ success: false, error: 'Message is required' });
-    }
-
-    // Build system prompt with context
-    const systemPrompt = `You are an expert DevOps Assistant helping a non-technical user manage their server and deployments.
-
-Current Server Status:
-- PM2 Processes: ${context?.pm2?.online || 0}/${context?.pm2?.total || 0} online (${context?.pm2?.errored || 0} errored)
-- CPU Usage: ${context?.system?.cpu || 0}%
-- Memory Usage: ${context?.system?.memory || 0}%
-- Disk Usage: ${context?.system?.disk || 0}%
-
-Your job is to:
-1. Explain technical concepts in simple, non-technical language
-2. Provide actionable advice and step-by-step guidance
-3. Identify and explain any issues found
-4. Suggest optimizations and best practices
-5. Help with deployments, debugging, and server management
-
-Keep responses friendly, clear, and practical. Use emojis where appropriate. Format important information with markdown.`;
-
-    // Try to connect to local LLM
-    try {
-      const response = await fetch(LLM_API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: LLM_MODEL,
-          prompt: `${systemPrompt}\n\nUser: ${message}\n\nAssistant:`,
-          stream: false,
-          options: {
-            temperature: 0.7,
-            top_p: 0.9,
-            max_tokens: 2000,
-          },
-        }),
-        timeout: 30000,
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return res.json({
-          success: true,
-          response: data.response || data.text || 'I apologize, but I could not generate a response.',
-        });
-      }
-    } catch (llmError) {
-      console.log('[AI] LLM not available, using intelligent fallback:', llmError.message);
-    }
-
-    // Fallback: Return success false so frontend uses fallback
-    res.json({
-      success: false,
-      error: 'LLM not available',
-    });
-  } catch (error) {
-    console.error('[AI] Error:', error);
-    res.json({
-      success: false,
-      error: error.message,
-    });
-  }
-});
 
 // ============================================================================
 // QUICK ACTIONS SYSTEM
@@ -3981,7 +3883,7 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-6-20250514',
         max_tokens: 4096,
         system: systemPrompt,
         messages,
@@ -4013,7 +3915,7 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
           'x-api-key': ANTHROPIC_API_KEY,
           'anthropic-version': '2023-06-01'
         },
-        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, system: systemPrompt, messages })
+        body: JSON.stringify({ model: 'claude-sonnet-4-6-20250514', max_tokens: 4096, system: systemPrompt, messages })
       });
 
       if (!final.ok) return { response: result.content[0]?.text, tools: toolCalls.length };
@@ -4219,7 +4121,7 @@ app.post('/api/ai/delegate', requireAuth, async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-sonnet-4-6-20250514',
         max_tokens: 4096,
         system: prompt,
         messages: [{ role: 'user', content: task }],
