@@ -509,7 +509,20 @@ app.get('/api/github/commits/:repo', async (req, res) => {
   try {
     const repo = sanitizeRepoName(req.params.repo);
     const data = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/commits?per_page=20`);
-    res.json({ success: true, data });
+    // Normalize GitHub API commit structure for frontend consistency
+    const normalized = data.map(c => ({
+      sha: c.sha,
+      message: c.commit?.message || '',
+      author: {
+        name: c.commit?.author?.name || c.author?.login || '',
+        date: c.commit?.author?.date || '',
+        email: c.commit?.author?.email || '',
+        avatarUrl: c.author?.avatar_url || '',
+        login: c.author?.login || '',
+      },
+      html_url: c.html_url,
+    }));
+    res.json({ success: true, data: normalized });
   } catch (error) {
     res.json({ success: false, error: error.message });
   }
@@ -4144,6 +4157,20 @@ app.post('/api/ai/delegate', requireAuth, async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// ── Global error handler (catches body-parser JSON errors etc.) ─────────────
+app.use((err, req, res, _next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, error: 'Invalid JSON in request body' });
+  }
+  console.error('[API Error]', err.message);
+  res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+});
+
+// ── Unhandled rejections ─────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
 });
 
 const PORT = process.env.DASHBOARD_API_PORT || 3999;
