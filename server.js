@@ -1212,12 +1212,18 @@ function validateFilePath(inputPath) {
     return null;
   }
 
-  // Normalize the path and resolve it relative to BASE_PATH
+  const resolvedInput = path.resolve(inputPath);
+  const resolvedProjects = path.resolve(PROJECTS_DIR);
+  const resolvedBase = path.resolve(BASE_PATH);
+
+  // Accept absolute paths within PROJECTS_DIR or BASE_PATH
+  if (resolvedInput.startsWith(resolvedProjects + path.sep) || resolvedInput === resolvedProjects) {
+    return resolvedInput;
+  }
+
+  // Accept relative paths joined to BASE_PATH
   const normalizedPath = path.normalize(inputPath).replace(/^(\.\.\/|\/)+/, '');
   const fullPath = path.join(BASE_PATH, normalizedPath);
-
-  // Ensure the resolved path is within BASE_PATH
-  const resolvedBase = path.resolve(BASE_PATH);
   const resolvedFull = path.resolve(fullPath);
 
   if (!resolvedFull.startsWith(resolvedBase + path.sep) && resolvedFull !== resolvedBase) {
@@ -1850,8 +1856,8 @@ app.post('/api/git/command', async (req, res) => {
 
     // Validate command against whitelist
     const isAllowed = ALLOWED_GIT_COMMANDS.includes(command) ||
-      /^git -C \/var\/www\/[\w._-]{1,100} (status|log|diff|pull|fetch|branch|checkout) .{0,200}$/.test(command) ||
-      /^git -C \/var\/www\/[\w._-]{1,100} (status|log|diff|pull|fetch|branch|checkout)$/.test(command);
+      /^git\s+(status|log|diff|pull|fetch|branch|checkout|add|commit|push|reset|stash)(\s+.{0,200})?$/.test(command) ||
+      /^git -C [\w./_-]{1,200} (status|log|diff|pull|fetch|branch|checkout|add|commit|push|reset|stash)(\s+.{0,200})?$/.test(command);
 
     if (!isAllowed) {
       return res.status(403).json({ success: false, error: 'Command not in allowlist. Allowed: git status, log, diff, pull, fetch, branch, checkout' });
@@ -2054,6 +2060,67 @@ app.get('/api/server/stats', async (req, res) => {
   try {
     const stats = await collectSystemStats();
     res.json({ success: true, data: stats });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/server/processes — list Docker containers as process records
+app.get('/api/server/processes', requireAuth, async (req, res) => {
+  try {
+    const { stdout } = await execAsync(
+      `docker ps -a --format '{{json .}}'`,
+      { timeout: 10000 }
+    );
+    const processes = stdout.trim().split('\n').filter(Boolean).map(line => {
+      try {
+        const c = JSON.parse(line);
+        return {
+          name: c.Names,
+          status: c.State === 'running' ? 'online' : 'stopped',
+          uptime: c.Status,
+          cpu: '0%',
+          memory: '0 MB',
+          pm_id: c.ID ? c.ID.slice(0, 12) : c.Names,
+          pid: 0,
+          instances: 1,
+          mode: 'docker',
+          image: c.Image,
+          ports: c.Ports || '',
+        };
+      } catch { return null; }
+    }).filter(Boolean);
+    res.json({ success: true, data: processes });
+  } catch (error) {
+    res.json({ success: true, data: [], error: error.message });
+  }
+});
+
+// GET /api/server/info — OS + runtime info
+app.get('/api/server/info', requireAuth, async (req, res) => {
+  try {
+    const [nodeVersion, dockerVersion] = await Promise.all([
+      execAsync('node --version').then(r => r.stdout.trim()).catch(() => 'unknown'),
+      execAsync('docker --version').then(r => r.stdout.trim()).catch(() => 'unavailable'),
+    ]);
+    res.json({
+      success: true,
+      data: {
+        hostname: os.hostname(),
+        platform: os.platform(),
+        arch: os.arch(),
+        release: os.release(),
+        uptime: os.uptime(),
+        nodeVersion,
+        dockerVersion,
+        totalMemory: os.totalmem(),
+        freeMemory: os.freemem(),
+        cpuCount: os.cpus().length,
+        cpuModel: os.cpus()[0]?.model || 'unknown',
+        loadAverage: os.loadavg(),
+        projectsDir: PROJECTS_DIR,
+      }
+    });
   } catch (error) {
     res.json({ success: false, error: error.message });
   }
