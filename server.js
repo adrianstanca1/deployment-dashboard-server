@@ -27,8 +27,6 @@ const execAsync = util.promisify(exec);
 const { SERVER_TOOLS } = require('./server-tools');
 const { executeTool } = require('./server-tool-executor');
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
 // ============================================================================
 // AUTH CONFIG
 // ============================================================================
@@ -46,13 +44,82 @@ if (!process.env.DASHBOARD_PASSWORD) {
 
 // GitHub config
 const GITHUB_USERNAME = process.env.DASHBOARD_GITHUB_USER || 'adrianstanca1';
+const PROJECTS_DIR = process.env.PROJECTS_DIR || '/opt/docker/projects';
+const APPS_DIR = process.env.APPS_DIR || PROJECTS_DIR;
 
 // Server public URL config
 const SERVER_PUBLIC_IP = process.env.SERVER_PUBLIC_IP || '72.62.132.43';
 const APPS_BASE_URL = process.env.APPS_BASE_URL || `http://${SERVER_PUBLIC_IP}`;
 
 const SETTINGS_FILE = path.join(__dirname, '.dashboard-settings.json');
+const AI_AUDIT_FILE = process.env.AI_AUDIT_FILE || '/app/logs/ai-audit-log.json';
+const AI_ALERT_FILE = process.env.AI_ALERT_FILE || '/app/logs/ai-alert-log.json';
 let runtimeSettings = null;
+
+const AI_HEALTH_TTL_MS = 30_000;
+const AI_ALERT_RETENTION = 50;
+const AI_AUDIT_RETENTION = 100;
+const aiRuntimeState = {
+  alerts: [],
+  audit: [],
+  health: {},
+  nextAlertId: 1,
+  nextAuditId: 1,
+};
+
+function saveAIAuditLog() {
+  try {
+    fs.mkdirSync(path.dirname(AI_AUDIT_FILE), { recursive: true });
+    fs.writeFileSync(AI_AUDIT_FILE, JSON.stringify({
+      nextAuditId: aiRuntimeState.nextAuditId,
+      audit: aiRuntimeState.audit,
+    }, null, 2));
+  } catch (error) {
+    console.warn('[AI Audit] Failed to persist audit log:', error.message);
+  }
+}
+
+function loadAIAuditLog() {
+  try {
+    if (!fs.existsSync(AI_AUDIT_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(AI_AUDIT_FILE, 'utf8'));
+    aiRuntimeState.audit = Array.isArray(parsed.audit)
+      ? parsed.audit.slice(0, AI_AUDIT_RETENTION)
+      : [];
+    aiRuntimeState.nextAuditId = Number.isFinite(parsed.nextAuditId)
+      ? Math.max(1, parsed.nextAuditId)
+      : (aiRuntimeState.audit.length + 1);
+  } catch (error) {
+    console.warn('[AI Audit] Failed to load audit log:', error.message);
+  }
+}
+
+function saveAIAlertLog() {
+  try {
+    fs.mkdirSync(path.dirname(AI_ALERT_FILE), { recursive: true });
+    fs.writeFileSync(AI_ALERT_FILE, JSON.stringify({
+      nextAlertId: aiRuntimeState.nextAlertId,
+      alerts: aiRuntimeState.alerts,
+    }, null, 2));
+  } catch (error) {
+    console.warn('[AI Alert] Failed to persist alert log:', error.message);
+  }
+}
+
+function loadAIAlertLog() {
+  try {
+    if (!fs.existsSync(AI_ALERT_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(AI_ALERT_FILE, 'utf8'));
+    aiRuntimeState.alerts = Array.isArray(parsed.alerts)
+      ? parsed.alerts.slice(0, AI_ALERT_RETENTION)
+      : [];
+    aiRuntimeState.nextAlertId = Number.isFinite(parsed.nextAlertId)
+      ? Math.max(1, parsed.nextAlertId)
+      : (aiRuntimeState.alerts.length + 1);
+  } catch (error) {
+    console.warn('[AI Alert] Failed to load alert log:', error.message);
+  }
+}
 
 // Cache for nginx path mappings: port -> path
 let nginxPortPathCache = null;
@@ -195,7 +262,17 @@ app.use(helmet());
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
-  message: { success: false, error: 'Too many requests, please try again later.' }
+  message: { success: false, error: 'Too many requests, please try again later.' },
+  skip: (req) => {
+    const header = req.headers.authorization;
+    if (!header?.startsWith('Bearer ')) return false;
+    try {
+      verifyToken(header.slice(7));
+      return true;
+    } catch {
+      return false;
+    }
+  },
 });
 app.use(limiter);
 
@@ -268,10 +345,78 @@ async function normalizePM2Process(p) {
 }
 
 async function getPM2List() {
-  const { stdout } = await execAsync('pm2 jlist');
-  const processes = JSON.parse(stdout);
-  // Use Promise.all to handle async normalization
-  return await Promise.all(processes.map(normalizePM2Process));
+  try {
+    const { stdout } = await execAsync('pm2 jlist');
+    const processes = JSON.parse(stdout);
+    return await Promise.all(processes.map(normalizePM2Process));
+  } catch (error) {
+    if ((error.stderr || error.message || '').includes('pm2: not found')) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function getProjectRows() {
+  const entries = await fsp.readdir(PROJECTS_DIR, { withFileTypes: true }).catch(() => []);
+  const projects = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const projectPath = path.join(PROJECTS_DIR, entry.name);
+    const repoCandidates = ['repo', 'repo-backend', 'repo-frontend', '.'];
+    let repoPath = null;
+
+    for (const candidate of repoCandidates) {
+      const fullPath = path.join(projectPath, candidate);
+      const { stdout } = await execAsync(`git -C "${fullPath}" rev-parse --is-inside-work-tree 2>/dev/null || true`);
+      if (stdout.trim() === 'true') {
+        repoPath = fullPath;
+        break;
+      }
+    }
+
+    const composePath = path.join(projectPath, 'docker-compose.yml');
+    const hasCompose = await fsp.access(composePath).then(() => true).catch(() => false);
+
+    let branch = 'n/a';
+    let clean = null;
+    let ahead = 0;
+    let behind = 0;
+
+    if (repoPath) {
+      const [{ stdout: branchOut }, { stdout: statusOut }, { stdout: upstreamOut }] = await Promise.all([
+        execAsync(`git -C "${repoPath}" branch --show-current 2>/dev/null || true`),
+        execAsync(`git -C "${repoPath}" status --porcelain 2>/dev/null || true`),
+        execAsync(`git -C "${repoPath}" rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true`),
+      ]);
+
+      branch = branchOut.trim() || 'detached';
+      clean = statusOut.trim().length === 0;
+
+      if (upstreamOut.trim()) {
+        const { stdout: countsOut } = await execAsync(`git -C "${repoPath}" rev-list --left-right --count HEAD...@{upstream} 2>/dev/null || true`);
+        const [aheadRaw, behindRaw] = countsOut.trim().split(/\s+/).map(Number);
+        ahead = Number.isFinite(aheadRaw) ? aheadRaw : 0;
+        behind = Number.isFinite(behindRaw) ? behindRaw : 0;
+      }
+    }
+
+    projects.push({
+      id: entry.name,
+      name: entry.name,
+      path: projectPath,
+      branch,
+      clean,
+      ahead,
+      behind,
+      hasCompose,
+      status: hasCompose ? 'managed' : 'unmanaged',
+    });
+  }
+
+  return projects.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function sendSSE(res, event, data) {
@@ -593,11 +738,36 @@ app.get('/api/github/actions/:repo', async (req, res) => {
   }
 });
 
+app.get('/api/github/tree/:repo', async (req, res) => {
+  try {
+    const repo = sanitizeRepoName(req.params.repo);
+    const ref = (req.query.ref) || 'HEAD';
+    const commitData = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/git/commits/${ref}`);
+    const treeSha = commitData.tree?.sha;
+    if (!treeSha) throw new Error('Unable to resolve tree');
+    const recursive = req.query.recursive !== 'false';
+    const tree = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/git/trees/${treeSha}?recursive=${recursive ? 1 : 0}`);
+    res.json({
+      success: true,
+      data: (tree?.tree ?? []).map((entry) => ({
+        path: entry.path,
+        type: entry.type,
+        mode: entry.mode,
+        size: entry.size,
+        url: entry.url,
+      })),
+      ref,
+    });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // Check if repo is cloned locally under /var/www
 app.get('/api/github/local-status/:repo', async (req, res) => {
   try {
     const repo = sanitizeRepoName(req.params.repo);
-    const repoPath = `/var/www/${repo}`;
+    const repoPath = path.join(APPS_DIR, repo);
     const exists = fs.existsSync(repoPath);
     let gitStatus = null;
     if (exists) {
@@ -629,7 +799,7 @@ app.get('/api/github/local-status/:repo', async (req, res) => {
 app.post('/api/github/pull-local/:repo', async (req, res) => {
   try {
     const repo = sanitizeRepoName(req.params.repo);
-    const repoPath = `/var/www/${repo}`;
+    const repoPath = path.join(APPS_DIR, repo);
     if (!fs.existsSync(repoPath)) return res.json({ success: false, error: 'Not cloned locally' });
     const { stdout, stderr } = await execAsync(`git -C "${repoPath}" pull`, { timeout: 30000 });
     res.json({ success: true, data: stdout || stderr });
@@ -948,7 +1118,7 @@ app.get('/api/github/commit-activity/:repo', async (req, res) => {
 
 app.get('/api/server/apps', async (req, res) => {
   try {
-    const { stdout } = await execAsync('ls -1 /var/www/');
+    const { stdout } = await execAsync(`ls -1 "${APPS_DIR}"`);
     res.json({ success: true, data: stdout.trim().split('\n').filter(Boolean) });
   } catch (error) {
     res.json({ success: false, error: error.message });
@@ -957,7 +1127,7 @@ app.get('/api/server/apps', async (req, res) => {
 
 app.get('/api/server/app/:name', async (req, res) => {
   try {
-    const appPath = `/var/www/${req.params.name}`;
+    const appPath = path.join(APPS_DIR, req.params.name);
     if (!fs.existsSync(appPath)) return res.json({ success: false, error: 'App not found' });
 
     let packageJson = null;
@@ -981,11 +1151,42 @@ app.get('/api/server/app/:name', async (req, res) => {
   }
 });
 
+app.get('/api/projects', async (req, res) => {
+  try {
+    const projects = await getProjectRows();
+    res.json({ success: true, data: projects });
+  } catch (error) {
+    res.json({ success: false, error: error.message, data: [] });
+  }
+});
+
+app.post('/api/projects/:name/deploy', async (req, res) => {
+  try {
+    const repo = sanitizeRepoName(req.params.name);
+    const { branch = 'main', port, pm2Name } = req.body || {};
+    res.json({
+      success: true,
+      data: {
+        repo,
+        branch,
+        port: port ?? null,
+        pm2Name: pm2Name ?? repo,
+      },
+      next: {
+        endpoint: '/api/deploy/pipeline',
+        method: 'POST',
+      },
+    });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================================================
 // ENHANCED FILE MANAGER
 // ============================================================================
 
-const BASE_PATH = '/var/www';
+const BASE_PATH = APPS_DIR;
 
 // Multer configuration for file uploads
 const upload = multer({
@@ -1367,7 +1568,38 @@ app.post('/api/docker/container/:action/:id', async (req, res) => {
   }
 });
 
+app.post('/api/docker/containers/:id/:action', async (req, res) => {
+  try {
+    const { action, id } = req.params;
+    const validActions = ['start', 'stop', 'restart', 'pause', 'unpause', 'kill'];
+    if (!validActions.includes(action)) {
+      return res.status(400).json({ success: false, error: 'Invalid action' });
+    }
+    validateContainerId(id);
+    await execAsync(`docker ${action} ${id}`);
+    res.json({ success: true });
+  } catch (error) {
+    if (error.message.includes('Invalid container ID')) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.delete('/api/docker/container/:id', async (req, res) => {
+  try {
+    const id = validateContainerId(req.params.id);
+    await execAsync(`docker rm -f ${id}`);
+    res.json({ success: true });
+  } catch (error) {
+    if (error.message.includes('Invalid container ID')) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/docker/containers/:id', async (req, res) => {
   try {
     const id = validateContainerId(req.params.id);
     await execAsync(`docker rm -f ${id}`);
@@ -1393,6 +1625,19 @@ app.get('/api/docker/container/:id/inspect', async (req, res) => {
   }
 });
 
+app.get('/api/docker/containers/:id/inspect', async (req, res) => {
+  try {
+    const id = validateContainerId(req.params.id);
+    const { stdout } = await execAsync(`docker inspect ${id}`);
+    res.json({ success: true, data: JSON.parse(stdout)[0] });
+  } catch (error) {
+    if (error.message.includes('Invalid container ID')) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/docker/container/:id/stats', async (req, res) => {
   try {
     const id = validateContainerId(req.params.id);
@@ -1403,6 +1648,33 @@ app.get('/api/docker/container/:id/stats', async (req, res) => {
       return res.status(400).json({ success: false, error: error.message });
     }
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/docker/containers/:id/stats', async (req, res) => {
+  try {
+    const id = validateContainerId(req.params.id);
+    const { stdout } = await execAsync(`docker stats ${id} --no-stream --format "{{json .}}"`);
+    res.json({ success: true, data: JSON.parse(stdout.trim()) });
+  } catch (error) {
+    if (error.message.includes('Invalid container ID')) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/docker/containers/:id/logs', async (req, res) => {
+  try {
+    const id = validateContainerId(req.params.id);
+    const lines = Math.max(1, Math.min(2000, parseInt(req.query.lines) || 200));
+    const { stdout, stderr } = await execAsync(`docker logs --tail ${lines} ${id} 2>&1`);
+    res.json({ success: true, data: stdout || stderr });
+  } catch (error) {
+    if (error.message.includes('Invalid container ID')) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
+    res.status(500).json({ success: false, error: error.message, data: error.stdout || error.stderr || '' });
   }
 });
 
@@ -1420,6 +1692,15 @@ app.get('/api/docker/volumes', async (req, res) => {
 });
 
 app.delete('/api/docker/volume/:name', async (req, res) => {
+  try {
+    await execAsync(`docker volume rm "${req.params.name}"`);
+    res.json({ success: true });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/docker/volumes/:name', async (req, res) => {
   try {
     await execAsync(`docker volume rm "${req.params.name}"`);
     res.json({ success: true });
@@ -1518,6 +1799,15 @@ app.delete('/api/docker/image/:id', async (req, res) => {
   }
 });
 
+app.delete('/api/docker/images/:id', async (req, res) => {
+  try {
+    await execAsync(`docker rmi ${req.params.id}`);
+    res.json({ success: true });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // System prune
 app.post('/api/docker/prune', async (req, res) => {
   try {
@@ -1567,7 +1857,7 @@ app.post('/api/git/command', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Command not in allowlist. Allowed: git status, log, diff, pull, fetch, branch, checkout' });
     }
 
-    const { stdout, stderr } = await execAsync(command, { cwd: cwd || '/var/www', timeout: 30000 });
+    const { stdout, stderr } = await execAsync(command, { cwd: cwd || APPS_DIR, timeout: 30000 });
     res.json({ success: true, data: stdout || stderr });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message, data: error.stdout || error.stderr });
@@ -1625,7 +1915,7 @@ app.post('/api/deploy/pipeline', async (req, res) => {
   });
 
   try {
-    const targetDir = `/var/www/${repo}`;
+    const targetDir = path.join(APPS_DIR, repo);
 
     if (fs.existsSync(targetDir)) {
       await runStep('git-pull', `git pull`, targetDir);
@@ -1668,7 +1958,7 @@ app.post('/api/deploy/clone', async (req, res) => {
     if (branch && !/^[a-zA-Z0-9._\/-]{1,100}$/.test(branch)) {
       return res.json({ success: false, error: 'Invalid branch name' });
     }
-    const targetDir = `/var/www/${repo}`;
+    const targetDir = path.join(APPS_DIR, repo);
     if (fs.existsSync(targetDir)) return res.json({ success: false, error: 'Directory already exists' });
     const { stdout } = await execAsync(`git clone --branch ${branch} --depth 1 https://github.com/${GITHUB_USERNAME}/${repo}.git ${targetDir}`);
     res.json({ success: true, data: stdout });
@@ -1680,7 +1970,7 @@ app.post('/api/deploy/clone', async (req, res) => {
 app.post('/api/deploy/build', async (req, res) => {
   try {
     const name = sanitizeRepoName(req.body.name);
-    const appPath = `/var/www/${name}`;
+    const appPath = path.join(APPS_DIR, name);
     const { stdout } = await execAsync(`cd ${appPath} && npm run build 2>&1`);
     res.json({ success: true, data: stdout });
   } catch (error) {
@@ -1691,7 +1981,7 @@ app.post('/api/deploy/build', async (req, res) => {
 app.post('/api/deploy/install', async (req, res) => {
   try {
     const name = sanitizeRepoName(req.body.name);
-    const appPath = `/var/www/${name}`;
+    const appPath = path.join(APPS_DIR, name);
     const { stdout } = await execAsync(`cd ${appPath} && npm install --legacy-peer-deps 2>&1`);
     res.json({ success: true, data: stdout });
   } catch (error) {
@@ -1760,6 +2050,15 @@ app.get('/api/system/stats', async (req, res) => {
   }
 });
 
+app.get('/api/server/stats', async (req, res) => {
+  try {
+    const stats = await collectSystemStats();
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // Network interfaces info
 app.get('/api/system/network', async (req, res) => {
   try {
@@ -1802,6 +2101,8 @@ let lastProcessStates = new Map();
 
 wssStatus.on('connection', (ws) => {
   console.log('[WS:status] Client connected');
+  let lastAiAlertAt = 0;
+  let lastAiAuditAt = 0;
 
   const interval = setInterval(async () => {
     try {
@@ -1819,6 +2120,23 @@ wssStatus.on('connection', (ws) => {
       }
       if (alerts.length > 0) {
         ws.send(JSON.stringify({ type: 'pm2-alert', data: alerts }));
+      }
+
+      await refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: false });
+      ws.send(JSON.stringify({ type: 'ai-status', data: getAIHealthSnapshot() }));
+      const freshAiAlerts = aiRuntimeState.alerts
+        .filter((alert) => alert.createdAt > lastAiAlertAt)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      if (freshAiAlerts.length > 0) {
+        lastAiAlertAt = freshAiAlerts[freshAiAlerts.length - 1].createdAt;
+        ws.send(JSON.stringify({ type: 'ai-alert', data: freshAiAlerts }));
+      }
+      const freshAiAudit = aiRuntimeState.audit
+        .filter((event) => event.createdAt > lastAiAuditAt)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      if (freshAiAudit.length > 0) {
+        lastAiAuditAt = freshAiAudit[freshAiAudit.length - 1].createdAt;
+        ws.send(JSON.stringify({ type: 'ai-audit', data: freshAiAudit }));
       }
     } catch (error) {
       ws.send(JSON.stringify({ type: 'error', data: error.message }));
@@ -1852,7 +2170,7 @@ wssTerminal.on('connection', (ws, request) => {
 
   // Validate docker container name to prevent injection
   const safeDocker = dockerContainer && /^[\w_.-]+$/.test(dockerContainer) ? dockerContainer : null;
-  const shellCmd = safeDocker ? 'docker' : '/bin/bash';
+  const shellCmd = safeDocker ? 'docker' : (fs.existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh');
   const shellArgs = safeDocker ? ['exec', '-it', safeDocker, '/bin/sh'] : [];
 
   const ptyProcess = pty.spawn(shellCmd, shellArgs, {
@@ -2500,7 +2818,7 @@ const predefinedActions = {
   // Update dependencies in all projects
   'npm-update-all': async () => {
     const results = [];
-    const appsDir = '/var/www';
+    const appsDir = APPS_DIR;
 
     try {
       const entries = fs.readdirSync(appsDir, { withFileTypes: true });
@@ -2549,7 +2867,7 @@ const predefinedActions = {
   // Create backups of all deployed apps
   'backup-all': async () => {
     const results = [];
-    const appsDir = '/var/www';
+    const appsDir = APPS_DIR;
     const backupDir = `/root/backups/${new Date().toISOString().split('T')[0]}`;
 
     try {
@@ -3318,80 +3636,656 @@ app.get('/api/settings/health', async (req, res) => {
 // ENHANCED AI ASSISTANT ENDPOINTS
 // ============================================================================
 
-// LLM Provider Configuration
-const LLM_CONFIG = {
+const AI_PROVIDER_META = {
   openai: {
-    enabled: !!process.env.OPENAI_API_KEY,
-    apiKey: process.env.OPENAI_API_KEY,
-    baseURL: 'https://api.openai.com/v1',
-    defaultModel: 'gpt-4-turbo-preview',
+    id: 'openai',
+    name: 'OpenAI',
     models: ['gpt-4-turbo-preview', 'gpt-4', 'gpt-3.5-turbo'],
+    defaults: {
+      baseURL: 'https://api.openai.com/v1',
+      defaultModel: 'gpt-4-turbo-preview',
+    },
+    env: {
+      apiKey: ['OPENAI_API_KEY'],
+      baseURL: ['OPENAI_BASE_URL'],
+      defaultModel: ['OPENAI_MODEL'],
+    },
+    essentialFields: ['apiKey'],
   },
   anthropic: {
-    enabled: !!process.env.ANTHROPIC_API_KEY,
-    apiKey: process.env.ANTHROPIC_API_KEY,
-    baseURL: 'https://api.anthropic.com/v1',
-    defaultModel: 'claude-3-sonnet-20240229',
+    id: 'anthropic',
+    name: 'Anthropic',
     models: ['claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307'],
+    defaults: {
+      baseURL: 'https://api.anthropic.com/v1',
+      defaultModel: 'claude-3-sonnet-20240229',
+    },
+    env: {
+      apiKey: ['ANTHROPIC_API_KEY'],
+      baseURL: ['ANTHROPIC_BASE_URL'],
+      defaultModel: ['ANTHROPIC_MODEL'],
+    },
+    essentialFields: ['apiKey'],
   },
   google: {
-    enabled: !!process.env.GOOGLE_API_KEY,
-    apiKey: process.env.GOOGLE_API_KEY,
-    baseURL: 'https://generativelanguage.googleapis.com/v1',
-    defaultModel: 'gemini-1.5-pro',
+    id: 'google',
+    name: 'Google',
     models: ['gemini-1.5-pro', 'gemini-1.5-flash'],
+    defaults: {
+      baseURL: 'https://generativelanguage.googleapis.com/v1',
+      defaultModel: 'gemini-1.5-pro',
+    },
+    env: {
+      apiKey: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'],
+      baseURL: ['GOOGLE_BASE_URL'],
+      defaultModel: ['GOOGLE_MODEL'],
+    },
+    essentialFields: ['apiKey'],
   },
   local: {
-    enabled: true,
-    baseURL: process.env.OLLAMA_URL || 'http://localhost:11434',
-    defaultModel: process.env.OLLAMA_MODEL || 'codellama:34b',
+    id: 'local',
+    name: 'Ollama',
     models: ['codellama:34b', 'mixtral:8x7b', 'llama3:70b', 'qwen2.5-coder:14b'],
+    defaults: {
+      baseURL: 'http://localhost:11434',
+      defaultModel: 'codellama:34b',
+    },
+    env: {
+      baseURL: ['OLLAMA_URL'],
+      defaultModel: ['OLLAMA_MODEL'],
+    },
+    essentialFields: ['baseURL'],
   },
   cloud: {
-    enabled: true,
-    description: 'Dashboard-managed cloud AI',
-    defaultModel: 'auto',
+    id: 'cloud',
+    name: 'Cloud',
     models: ['auto', 'fast', 'balanced', 'powerful'],
+    defaults: {
+      defaultModel: 'auto',
+    },
+    env: {
+      defaultModel: ['CLOUD_MODEL'],
+    },
+    essentialFields: [],
   },
 };
 
 let activeProvider = process.env.DEFAULT_AI_PROVIDER || 'cloud';
 
-// Get available AI providers
-app.get('/api/ai/providers', (req, res) => {
-  const providers = Object.entries(LLM_CONFIG).map(([key, config]) => ({
-    id: key,
-    name: key.charAt(0).toUpperCase() + key.slice(1),
-    enabled: config.enabled,
-    defaultModel: config.defaultModel,
-    models: config.models || [],
-    isActive: key === activeProvider,
-  }));
+function getEnvValue(names, fallback = '') {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') return value;
+  }
+  return fallback;
+}
 
+function setEnvValue(envVar, value) {
+  if (value === undefined || value === null || value === '') {
+    delete process.env[envVar];
+  } else {
+    process.env[envVar] = String(value);
+  }
+}
+
+function persistEnvChanges(updates) {
+  const envPath = path.join(__dirname, '.env');
+  let content = '';
+  try { content = fs.readFileSync(envPath, 'utf8'); } catch {}
+
+  const lines = content ? content.split('\n') : [];
+  const indexByKey = new Map();
+  lines.forEach((line, index) => {
+    const match = line.match(/^([A-Z0-9_]+)=/);
+    if (match) indexByKey.set(match[1], index);
+  });
+
+  for (const [envVar, value] of Object.entries(updates)) {
+    const existingIndex = indexByKey.get(envVar);
+    if (value === null || value === undefined || value === '') {
+      if (existingIndex !== undefined) lines.splice(existingIndex, 1);
+    } else {
+      const serialized = `${envVar}=${String(value)}`;
+      if (existingIndex !== undefined) lines[existingIndex] = serialized;
+      else lines.push(serialized);
+    }
+  }
+
+  const normalized = lines.filter((line, index, arr) => !(index === arr.length - 1 && line === '')).join('\n');
+  fs.writeFileSync(envPath, normalized ? `${normalized}\n` : '');
+}
+
+function getProviderConfig(provider) {
+  const meta = AI_PROVIDER_META[provider];
+  if (!meta) return null;
+
+  const config = {
+    id: provider,
+    name: meta.name,
+    models: meta.models,
+    defaultModel: getEnvValue(meta.env.defaultModel || [], meta.defaults.defaultModel || ''),
+    baseURL: getEnvValue(meta.env.baseURL || [], meta.defaults.baseURL || ''),
+    apiKey: getEnvValue(meta.env.apiKey || [], ''),
+    description: provider === 'cloud' ? 'Dashboard-managed cloud AI' : undefined,
+  };
+
+  config.enabled = meta.essentialFields.every((field) => {
+    if (field === 'apiKey') return !!config.apiKey;
+    if (field === 'baseURL') return !!config.baseURL;
+    return true;
+  }) || provider === 'cloud';
+
+  return config;
+}
+
+function getAllProviderConfigs() {
+  return Object.keys(AI_PROVIDER_META).reduce((acc, provider) => {
+    acc[provider] = getProviderConfig(provider);
+    return acc;
+  }, {});
+}
+
+function maskSecret(value) {
+  if (!value) return '';
+  if (value.length <= 8) return '*'.repeat(value.length);
+  return `${value.slice(0, 4)}${'*'.repeat(Math.max(0, value.length - 8))}${value.slice(-4)}`;
+}
+
+function pushAIAlert(provider, level, message, details = {}) {
+  const now = Date.now();
+  const recent = aiRuntimeState.alerts.find((alert) =>
+    alert.provider === provider &&
+    alert.level === level &&
+    alert.message === message &&
+    (now - alert.createdAt) < 60_000
+  );
+  if (recent) {
+    recent.createdAt = now;
+    recent.details = details;
+    return recent;
+  }
+
+  const alert = {
+    id: `ai-alert-${aiRuntimeState.nextAlertId++}`,
+    provider,
+    level,
+    message,
+    createdAt: now,
+    details,
+  };
+  aiRuntimeState.alerts.unshift(alert);
+  aiRuntimeState.alerts = aiRuntimeState.alerts.slice(0, AI_ALERT_RETENTION);
+  saveAIAlertLog();
+  return alert;
+}
+
+function pushAIAudit(event) {
+  const auditEvent = {
+    id: `ai-audit-${aiRuntimeState.nextAuditId++}`,
+    createdAt: Date.now(),
+    ...event,
+  };
+  aiRuntimeState.audit.unshift(auditEvent);
+  aiRuntimeState.audit = aiRuntimeState.audit.slice(0, AI_AUDIT_RETENTION);
+  saveAIAuditLog();
+  return auditEvent;
+}
+
+function updateProviderHealth(provider, patch) {
+  const previous = aiRuntimeState.health[provider] || {};
+  const next = {
+    provider,
+    healthy: false,
+    status: 'unknown',
+    message: 'Not checked yet',
+    lastCheckedAt: Date.now(),
+    lastFailureAt: previous.lastFailureAt || null,
+    lastRecoveryAt: previous.lastRecoveryAt || null,
+    lastHealthyAt: previous.lastHealthyAt || null,
+    consecutiveFailures: previous.consecutiveFailures || 0,
+    ...previous,
+    ...patch,
+  };
+
+  if (next.healthy) {
+    if (previous.healthy === false) {
+      next.lastRecoveryAt = next.lastCheckedAt;
+      pushAIAlert(provider, 'info', `${AI_PROVIDER_META[provider].name} recovered`, {
+        status: next.status,
+        message: next.message,
+      });
+    }
+    next.lastHealthyAt = next.lastCheckedAt;
+    next.consecutiveFailures = 0;
+  } else {
+    next.lastFailureAt = next.lastCheckedAt;
+    next.consecutiveFailures = (previous.consecutiveFailures || 0) + 1;
+    if (patch.raiseAlert !== false) {
+      pushAIAlert(provider, 'error', `${AI_PROVIDER_META[provider].name} is failing`, {
+        status: next.status,
+        message: next.message,
+      });
+    }
+  }
+
+  delete next.raiseAlert;
+  aiRuntimeState.health[provider] = next;
+  return next;
+}
+
+function summarizeProviderErrorBody(rawBody = '') {
+  if (!rawBody) return '';
+
+  const trimmed = rawBody.trim();
+  if (!trimmed) return '';
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const nestedMessage =
+      parsed?.error?.message ||
+      parsed?.error?.details ||
+      parsed?.message ||
+      parsed?.details ||
+      '';
+    return String(nestedMessage || '').trim().slice(0, 200);
+  } catch {
+    return trimmed.replace(/\s+/g, ' ').slice(0, 200);
+  }
+}
+
+function classifyProviderFailure(provider, response, detail = '') {
+  const status = response?.status || 0;
+  const providerLabel = AI_PROVIDER_META[provider]?.name || provider;
+  const suffix = detail ? `: ${detail}` : '';
+
+  if (status === 400) {
+    return {
+      healthy: false,
+      status: 'configuration_error',
+      message: `${providerLabel} rejected the current request or model configuration${suffix}`,
+    };
+  }
+
+  if (status === 401) {
+    return {
+      healthy: false,
+      status: 'invalid_credentials',
+      message: `${providerLabel} rejected the configured credentials${suffix}`,
+    };
+  }
+
+  if (status === 403) {
+    return {
+      healthy: false,
+      status: 'access_denied',
+      message: `${providerLabel} denied access for the configured credentials${suffix}`,
+    };
+  }
+
+  if (status === 404) {
+    return {
+      healthy: false,
+      status: 'invalid_base_url',
+      message: `${providerLabel} base URL or endpoint is invalid${suffix}`,
+    };
+  }
+
+  if (status === 408 || status === 429) {
+    return {
+      healthy: false,
+      status: 'rate_limited',
+      message: `${providerLabel} is temporarily rate limited or timed out${suffix}`,
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      healthy: false,
+      status: 'provider_unavailable',
+      message: `${providerLabel} is currently unavailable${suffix}`,
+    };
+  }
+
+  return {
+    healthy: false,
+    status: 'error',
+    message: `${providerLabel} health check failed${suffix}`,
+  };
+}
+
+function classifyProviderException(provider, error) {
+  const providerLabel = AI_PROVIDER_META[provider]?.name || provider;
+  const message = String(error?.message || 'Unknown error');
+
+  if (message.includes('timed out') || error?.name === 'TimeoutError') {
+    return {
+      healthy: false,
+      status: 'timeout',
+      message: `${providerLabel} did not respond before the health check timeout`,
+    };
+  }
+
+  if (
+    message.includes('fetch failed') ||
+    message.includes('ECONNREFUSED') ||
+    message.includes('ENOTFOUND') ||
+    message.includes('EHOSTUNREACH')
+  ) {
+    return {
+      healthy: false,
+      status: 'unreachable',
+      message: `${providerLabel} could not be reached from the dashboard host`,
+    };
+  }
+
+  return {
+    healthy: false,
+    status: 'error',
+    message,
+  };
+}
+
+async function checkProviderHealth(provider, { force = false } = {}) {
+  const meta = AI_PROVIDER_META[provider];
+  if (!meta) return null;
+
+  const current = aiRuntimeState.health[provider];
+  if (!force && current && (Date.now() - current.lastCheckedAt) < AI_HEALTH_TTL_MS) {
+    return current;
+  }
+
+  const config = getProviderConfig(provider);
+  const missingField = meta.essentialFields.find((field) => !config[field]);
+  if (missingField) {
+    return updateProviderHealth(provider, {
+      healthy: false,
+      status: 'missing_credentials',
+      message: `Missing ${missingField}`,
+      lastCheckedAt: Date.now(),
+      raiseAlert: false,
+    });
+  }
+
+  try {
+    if (provider === 'openai') {
+      const response = await fetch(`${config.baseURL}/models`, {
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        const detail = summarizeProviderErrorBody(await response.text());
+        return updateProviderHealth(provider, {
+          ...classifyProviderFailure(provider, response, detail),
+          lastCheckedAt: Date.now(),
+        });
+      }
+    } else if (provider === 'anthropic') {
+      const response = await fetch(`${config.baseURL}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': config.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: config.defaultModel,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'ping' }],
+        }),
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!response.ok) {
+        const detail = summarizeProviderErrorBody(await response.text());
+        return updateProviderHealth(provider, {
+          ...classifyProviderFailure(provider, response, detail),
+          lastCheckedAt: Date.now(),
+        });
+      }
+    } else if (provider === 'google') {
+      const response = await fetch(`${config.baseURL}/models?key=${encodeURIComponent(config.apiKey)}`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        const detail = summarizeProviderErrorBody(await response.text());
+        return updateProviderHealth(provider, {
+          ...classifyProviderFailure(provider, response, detail),
+          lastCheckedAt: Date.now(),
+        });
+      }
+    } else if (provider === 'local') {
+      const response = await fetch(`${config.baseURL}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        const detail = summarizeProviderErrorBody(await response.text());
+        return updateProviderHealth(provider, {
+          ...classifyProviderFailure(provider, response, detail),
+          lastCheckedAt: Date.now(),
+        });
+      }
+    }
+
+    return updateProviderHealth(provider, {
+      healthy: true,
+      status: 'healthy',
+      message: 'Ready',
+      lastCheckedAt: Date.now(),
+    });
+  } catch (error) {
+    return updateProviderHealth(provider, {
+      ...classifyProviderException(provider, error),
+      lastCheckedAt: Date.now(),
+    });
+  }
+}
+
+async function refreshAIHealth(providers = Object.keys(AI_PROVIDER_META), options = {}) {
+  const checks = await Promise.all(providers.map((provider) => checkProviderHealth(provider, options)));
+  const activeHealth = getProviderHealth(activeProvider);
+  if (!activeHealth.healthy) {
+    const fallback = buildProviderOrder(activeProvider).find((provider) => {
+      const health = getProviderHealth(provider);
+      const config = getProviderConfig(provider);
+      return provider !== activeProvider && config?.enabled && (health.healthy || provider === 'cloud');
+    });
+    if (fallback && fallback !== activeProvider) {
+      const previousProvider = activeProvider;
+      activeProvider = fallback;
+      setEnvValue('DEFAULT_AI_PROVIDER', fallback);
+      persistEnvChanges({ DEFAULT_AI_PROVIDER: fallback });
+      pushAIAudit({
+        type: 'auto-fallback',
+        provider: fallback,
+        actor: 'system',
+        message: `Switched active AI provider from ${previousProvider} to ${fallback}`,
+        details: {
+          previousProvider,
+          nextProvider: fallback,
+          reason: activeHealth.message,
+        },
+      });
+      pushAIAlert(fallback, 'info', `Switched active AI provider to ${AI_PROVIDER_META[fallback].name}`, {
+        message: `Recovered from ${AI_PROVIDER_META[activeHealth.provider || providers[0]]?.name || 'provider'} failure`,
+      });
+    }
+  }
+  return checks.filter(Boolean);
+}
+
+function getProviderHealth(provider) {
+  return aiRuntimeState.health[provider] || {
+    provider,
+    healthy: provider === 'cloud',
+    status: provider === 'cloud' ? 'healthy' : 'unknown',
+    message: provider === 'cloud' ? 'Ready' : 'Not checked yet',
+    lastCheckedAt: 0,
+    lastFailureAt: null,
+    lastRecoveryAt: null,
+    lastHealthyAt: null,
+    consecutiveFailures: 0,
+  };
+}
+
+function getAIHealthSnapshot() {
+  const configs = getAllProviderConfigs();
+  const providers = Object.keys(AI_PROVIDER_META).map((provider) => {
+    const config = configs[provider];
+    return {
+      id: provider,
+      name: config.name,
+      enabled: config.enabled,
+      defaultModel: config.defaultModel,
+      baseURL: config.baseURL || null,
+      models: config.models || [],
+      isActive: provider === activeProvider,
+      health: getProviderHealth(provider),
+      credentialsMissing: AI_PROVIDER_META[provider].essentialFields.filter((field) => !config[field]),
+    };
+  });
+
+  return {
+    activeProvider,
+    providers,
+    alerts: aiRuntimeState.alerts.slice(0, 10),
+    audit: aiRuntimeState.audit.slice(0, 20),
+    timestamp: Date.now(),
+  };
+}
+
+function buildProviderOrder(preferredProvider) {
+  const configs = getAllProviderConfigs();
+  const ordered = [preferredProvider, activeProvider, 'anthropic', 'openai', 'google', 'cloud', 'local']
+    .filter((provider, index, arr) => provider && arr.indexOf(provider) === index)
+    .filter((provider) => AI_PROVIDER_META[provider] && configs[provider]?.enabled);
+
+  if (!ordered.includes('cloud')) ordered.push('cloud');
+  if (!ordered.includes('local') && configs.local?.enabled) ordered.push('local');
+  return ordered;
+}
+
+function applyProviderValues(provider, values = {}, removeFields = []) {
+  const meta = AI_PROVIDER_META[provider];
+  if (!meta) throw new Error('Invalid provider');
+
+  const envUpdates = {};
+  const allFields = new Set([
+    ...Object.keys(meta.env || {}),
+    ...Object.keys(values || {}),
+    ...removeFields,
+  ]);
+
+  for (const field of allFields) {
+    const envVars = meta.env[field];
+    if (!envVars) continue;
+
+    const shouldRemove = removeFields.includes(field);
+    const nextValue = shouldRemove ? null : values[field];
+
+    for (const envVar of envVars) {
+      envUpdates[envVar] = nextValue ?? null;
+      setEnvValue(envVar, nextValue ?? null);
+    }
+  }
+
+  persistEnvChanges(envUpdates);
+  return getProviderConfig(provider);
+}
+
+app.get('/api/ai/providers', async (req, res) => {
+  await refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: false });
+  const snapshot = getAIHealthSnapshot();
   res.json({
     success: true,
-    data: providers,
-    active: activeProvider,
+    data: snapshot.providers,
+    active: snapshot.activeProvider,
+    alerts: snapshot.alerts,
   });
 });
 
-// Switch active provider
-app.post('/api/ai/providers/:provider', requireAuth, (req, res) => {
-  const { provider } = req.params;
+app.get('/api/ai/health', requireAuth, async (req, res) => {
+  await refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: false });
+  res.json({ success: true, data: getAIHealthSnapshot() });
+});
 
-  if (!LLM_CONFIG[provider]) {
+app.get('/api/ai/audit', requireAuth, async (req, res) => {
+  res.json({ success: true, data: aiRuntimeState.audit.slice(0, 50) });
+});
+
+app.get('/api/ai/audit/export', requireAuth, async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="ai-audit-${new Date().toISOString().slice(0, 10)}.json"`);
+  res.json({
+    success: true,
+    exportedAt: Date.now(),
+    data: aiRuntimeState.audit,
+  });
+});
+
+app.post('/api/ai/health/check', requireAuth, async (req, res) => {
+  const user = req.user?.username || 'unknown';
+  const providers = Array.isArray(req.body?.providers) && req.body.providers.length > 0
+    ? req.body.providers.filter((provider) => AI_PROVIDER_META[provider])
+    : Object.keys(AI_PROVIDER_META);
+  const results = await refreshAIHealth(providers, { force: true });
+  pushAIAudit({
+    type: 'health-check',
+    provider: providers.length === 1 ? providers[0] : 'all',
+    actor: user,
+    message: `${user} ran an AI health check for ${providers.length === 1 ? AI_PROVIDER_META[providers[0]]?.name || providers[0] : `${providers.length} providers`}`,
+    details: {
+      status: results.every((result) => result?.healthy) ? 'healthy' : 'attention_required',
+      providers: results.map((result) => ({
+        provider: result?.provider,
+        healthy: result?.healthy,
+        status: result?.status,
+        message: result?.message,
+      })),
+    },
+  });
+  res.json({ success: true, data: getAIHealthSnapshot() });
+});
+
+app.post('/api/ai/providers/:provider', requireAuth, async (req, res) => {
+  const { provider } = req.params;
+  const user = req.user?.username || 'unknown';
+
+  if (!AI_PROVIDER_META[provider]) {
     return res.status(400).json({ success: false, error: 'Invalid provider' });
   }
 
-  if (!LLM_CONFIG[provider].enabled) {
+  const config = getProviderConfig(provider);
+  if (!config.enabled) {
     return res.status(400).json({
       success: false,
-      error: 'Provider not configured - check API key in environment variables',
+      error: 'Provider not configured',
+      resolution: `Update ${AI_PROVIDER_META[provider].name} credentials in AI Settings`,
     });
   }
 
   activeProvider = provider;
-  res.json({ success: true, data: { active: provider } });
+  setEnvValue('DEFAULT_AI_PROVIDER', provider);
+  persistEnvChanges({ DEFAULT_AI_PROVIDER: provider });
+  const health = await checkProviderHealth(provider, { force: true });
+  pushAIAudit({
+    type: 'provider-switch',
+    provider,
+    actor: user,
+    message: `${user} set ${provider} as the active AI provider`,
+    details: {
+      provider,
+      healthy: !!health?.healthy,
+      status: health?.status || 'unknown',
+    },
+  });
+
+  res.json({
+    success: true,
+    data: {
+      active: provider,
+      health,
+      warning: health?.healthy ? null : `${AI_PROVIDER_META[provider].name} is currently unhealthy`,
+    },
+  });
 });
 
 // Get AI capabilities
@@ -3442,37 +4336,64 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Message required' });
     }
 
-    const useProvider = provider || activeProvider;
-    const config = LLM_CONFIG[useProvider];
-
+    const requestedProvider = provider || activeProvider;
+    const providerOrder = buildProviderOrder(requestedProvider);
     let response = null;
     let toolInfo = null;
+    let resolvedProvider = requestedProvider;
+    let resolvedModel = model || getProviderConfig(requestedProvider)?.defaultModel;
+    let recoveryNote = null;
+    let lastProviderError = null;
 
-    // Try Claude with tools for Anthropic provider
-    if (useProvider === 'anthropic' && ANTHROPIC_API_KEY) {
-      const result = await processWithTools(message, context);
-      if (result) {
-        response = result.response;
-        toolInfo = { calls: result.tools || 0 };
+    for (const candidate of providerOrder) {
+      const candidateConfig = getProviderConfig(candidate);
+      if (!candidateConfig?.enabled) continue;
+
+      try {
+        if (candidate === 'anthropic') {
+          const result = await processWithTools(message, context, candidateConfig);
+          response = result.response;
+          toolInfo = { calls: result.tools || 0 };
+        } else if (candidate === 'openai') {
+          const result = await processWithOpenAI(message, context, candidateConfig);
+          response = result.response;
+          toolInfo = { calls: result.tools || 0 };
+        } else if (candidate === 'google' || candidate === 'local' || candidate === 'cloud') {
+          response = generateIntelligentResponse(message, context);
+          toolInfo = null;
+        }
+
+        if (response) {
+          resolvedProvider = candidate;
+          resolvedModel = model || candidateConfig.defaultModel;
+          updateProviderHealth(candidate, {
+            healthy: true,
+            status: 'healthy',
+            message: 'Request succeeded',
+            lastCheckedAt: Date.now(),
+          });
+          if (candidate !== requestedProvider) {
+            recoveryNote = `Recovered automatically by switching from ${requestedProvider} to ${candidate}`;
+            if (!provider || activeProvider === requestedProvider) {
+              activeProvider = candidate;
+              setEnvValue('DEFAULT_AI_PROVIDER', candidate);
+              persistEnvChanges({ DEFAULT_AI_PROVIDER: candidate });
+            }
+          }
+          break;
+        }
+      } catch (error) {
+        lastProviderError = error.message;
+        updateProviderHealth(candidate, {
+          healthy: false,
+          status: 'error',
+          message: error.message,
+          lastCheckedAt: Date.now(),
+        });
       }
     }
 
-    // Try OpenAI with tools for OpenAI provider
-    if (useProvider === 'openai' && LLM_CONFIG.openai.apiKey) {
-      const result = await processWithOpenAI(message, context);
-      if (result) {
-        response = result.response;
-        toolInfo = { calls: result.tools || 0 };
-      }
-    }
-
-    // Try local Ollama (limited tool support)
-    if (useProvider === 'local') {
-      // Ollama doesn't support function calling natively, use rule-based
-      response = generateIntelligentResponse(message, context);
-    }
-
-    // Fall back to rule-based response
+    // Fall back to rule-based response if every provider failed
     if (!response) {
       // Check for simple function name - try to execute it directly
       const lowerMsg = message.toLowerCase().trim();
@@ -3495,16 +4416,21 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       if (!response) {
         response = generateIntelligentResponse(message, context);
       }
+      recoveryNote = recoveryNote || (lastProviderError ? `All configured providers failed; using local fallback. Last error: ${lastProviderError}` : 'Using built-in fallback responder');
+      resolvedProvider = 'cloud';
+      resolvedModel = 'fallback';
     }
 
     res.json({
       success: true,
       response,
-      provider: useProvider,
-      model: model || config?.defaultModel,
+      provider: resolvedProvider,
+      model: resolvedModel,
       capability,
       actions: generateAIActions(message, context, capability),
-      toolInfo
+      toolInfo,
+      warning: recoveryNote,
+      activeProvider,
     });
   } catch (error) {
     console.error('[AI] Error:', error);
@@ -3876,8 +4802,8 @@ app.get('*', (req, res, next) => {
 // AI TOOL PROCESSING
 // ============================================================================
 
-async function processWithTools(message, context) {
-  if (!ANTHROPIC_API_KEY) return null;
+async function processWithTools(message, context, providerConfig = getProviderConfig('anthropic')) {
+  if (!providerConfig?.apiKey) throw new Error('Anthropic API key is missing');
 
   const systemPrompt = `You are a DevOps Assistant with tools to manage the server.
 
@@ -3890,15 +4816,15 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
   const messages = [{ role: 'user', content: message }];
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch(`${providerConfig.baseURL}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
+        'x-api-key': providerConfig.apiKey,
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6-20250514',
+        model: providerConfig.defaultModel,
         max_tokens: 4096,
         system: systemPrompt,
         messages,
@@ -3907,7 +4833,9 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
       })
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      throw new Error(`Anthropic responded ${response.status}`);
+    }
 
     const result = await response.json();
     const toolCalls = result.content?.filter(c => c.type === 'tool_use') || [];
@@ -3923,14 +4851,14 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
       messages.push({ role: 'assistant', content: result.content });
       messages.push({ role: 'user', content: toolResults });
 
-      const final = await fetch('https://api.anthropic.com/v1/messages', {
+      const final = await fetch(`${providerConfig.baseURL}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_API_KEY,
+          'x-api-key': providerConfig.apiKey,
           'anthropic-version': '2023-06-01'
         },
-        body: JSON.stringify({ model: 'claude-sonnet-4-6-20250514', max_tokens: 4096, system: systemPrompt, messages })
+        body: JSON.stringify({ model: providerConfig.defaultModel, max_tokens: 4096, system: systemPrompt, messages })
       });
 
       if (!final.ok) return { response: result.content[0]?.text, tools: toolCalls.length };
@@ -3941,7 +4869,7 @@ Use tools when the user asks about server status, logs, files, git, or wants to 
     return { response: result.content[0]?.text };
   } catch (error) {
     console.error('[Tool Error]:', error.message);
-    return null;
+    throw error;
   }
 }
 
@@ -3963,22 +4891,22 @@ function convertToolsToOpenAI(tools) {
 }
 
 // Process with OpenAI function calling
-async function processWithOpenAI(message, context) {
-  const openaiKey = LLM_CONFIG.openai.apiKey;
-  if (!openaiKey) return null;
+async function processWithOpenAI(message, context, providerConfig = getProviderConfig('openai')) {
+  const openaiKey = providerConfig?.apiKey;
+  if (!openaiKey) throw new Error('OpenAI API key is missing');
 
   const systemPrompt = `You are a DevOps Assistant with tools to manage the server. Use tools when the user asks about server status, logs, files, git, or wants to restart services.`;
 
   try {
     // First call with tools
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(`${providerConfig.baseURL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${openaiKey}`
       },
       body: JSON.stringify({
-        model: 'gpt-4-turbo-preview',
+        model: providerConfig.defaultModel,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: message }
@@ -3988,7 +4916,9 @@ async function processWithOpenAI(message, context) {
       })
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      throw new Error(`OpenAI responded ${response.status}`);
+    }
     const result = await response.json();
     const toolCalls = result.choices?.[0]?.message?.tool_calls || [];
 
@@ -4014,14 +4944,14 @@ async function processWithOpenAI(message, context) {
       messages.push(...toolResults);
 
       // Second call with results
-      const final = await fetch('https://api.openai.com/v1/chat/completions', {
+      const final = await fetch(`${providerConfig.baseURL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${openaiKey}`
         },
         body: JSON.stringify({
-          model: 'gpt-4-turbo-preview',
+          model: providerConfig.defaultModel,
           messages
         })
       });
@@ -4034,82 +4964,143 @@ async function processWithOpenAI(message, context) {
     return { response: result.choices[0]?.message?.content };
   } catch (error) {
     console.error('[OpenAI Tool Error]:', error.message);
-    return null;
+    throw error;
   }
 }
 
-// API Key Management
-const API_KEYS = {
-  openai: process.env.OPENAI_API_KEY || '',
-  anthropic: process.env.ANTHROPIC_API_KEY || '',
-  google: process.env.GOOGLE_API_KEY || '',
-  ollama: process.env.OLLAMA_URL || 'http://localhost:11434',
-};
+app.get('/api/ai/keys', requireAuth, async (req, res) => {
+  await refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: false });
 
-const ENV_VAR_MAP = {
-  openai: 'OPENAI_API_KEY',
-  anthropic: 'ANTHROPIC_API_KEY',
-  google: 'GOOGLE_API_KEY',
-  ollama: 'OLLAMA_URL',
-};
+  const keys = Object.keys(AI_PROVIDER_META).reduce((acc, provider) => {
+    const meta = AI_PROVIDER_META[provider];
+    const config = getProviderConfig(provider);
+    acc[provider] = {
+      provider,
+      name: meta.name,
+      configured: config.enabled,
+      fields: {
+        apiKey: maskSecret(config.apiKey || ''),
+        baseURL: config.baseURL || '',
+        defaultModel: config.defaultModel || '',
+      },
+      hasStoredSecret: !!config.apiKey,
+      envVars: {
+        apiKey: meta.env.apiKey || [],
+        baseURL: meta.env.baseURL || [],
+        defaultModel: meta.env.defaultModel || [],
+      },
+      health: getProviderHealth(provider),
+      essentialFields: meta.essentialFields,
+    };
+    return acc;
+  }, {});
 
-// Persist a key to the .env file so it survives PM2 restarts
-function persistKeyToEnv(envVar, value) {
-  const envPath = path.join(__dirname, '.env');
-  let content = '';
-  try { content = fs.readFileSync(envPath, 'utf8'); } catch {}
-  const lines = content.split('\n');
-  const idx = lines.findIndex(l => l.startsWith(`${envVar}=`));
-  if (idx >= 0) {
-    lines[idx] = `${envVar}=${value}`;
-  } else {
-    lines.push(`${envVar}=${value}`);
-  }
-  fs.writeFileSync(envPath, lines.filter((_, i) => i === lines.length - 1 ? true : true).join('\n'));
-}
-
-// Mask API key for display (show last 4 chars only)
-function maskKey(key) {
-  if (!key || key.length < 8) return key;
-  return `${'*'.repeat(key.length - 4)}${key.slice(-4)}`;
-}
-
-// Get all API keys status
-app.get('/api/ai/keys', requireAuth, (req, res) => {
-  res.json({
-    success: true,
-    keys: {
-      openai: { configured: !!API_KEYS.openai, envVar: 'OPENAI_API_KEY', value: maskKey(API_KEYS.openai) },
-      anthropic: { configured: !!API_KEYS.anthropic, envVar: 'ANTHROPIC_API_KEY', value: maskKey(API_KEYS.anthropic) },
-      google: { configured: !!API_KEYS.google, envVar: 'GOOGLE_API_KEY', value: maskKey(API_KEYS.google) },
-      ollama: { configured: !!API_KEYS.ollama, envVar: 'OLLAMA_URL', value: API_KEYS.ollama }
-    }
-  });
+  res.json({ success: true, data: keys });
 });
 
-// Update API key — persists to .env for survival across restarts
-app.post('/api/ai/keys', requireAuth, (req, res) => {
-  const { provider, apiKey, baseURL } = req.body;
+app.post('/api/ai/keys', requireAuth, async (req, res) => {
+  try {
+    const { provider, values = {}, removeFields = [], apiKey, baseURL, defaultModel } = req.body || {};
+    const normalizedProvider = provider === 'ollama' ? 'local' : provider;
+    const user = req.user?.username || 'unknown';
 
-  if (!provider || !Object.prototype.hasOwnProperty.call(API_KEYS, provider)) {
-    return res.status(400).json({ success: false, error: 'Invalid provider' });
+    if (!normalizedProvider || !AI_PROVIDER_META[normalizedProvider]) {
+      return res.status(400).json({ success: false, error: 'Invalid provider' });
+    }
+
+    const nextValues = { ...values };
+    if (apiKey !== undefined) nextValues.apiKey = apiKey;
+    if (baseURL !== undefined) nextValues.baseURL = baseURL;
+    if (defaultModel !== undefined) nextValues.defaultModel = defaultModel;
+
+    if (nextValues.apiKey === '') {
+      delete nextValues.apiKey;
+    }
+
+    const changedFields = [
+      ...(Object.prototype.hasOwnProperty.call(nextValues, 'apiKey') ? ['apiKey'] : []),
+      ...(Object.prototype.hasOwnProperty.call(nextValues, 'baseURL') ? ['baseURL'] : []),
+      ...(Object.prototype.hasOwnProperty.call(nextValues, 'defaultModel') ? ['defaultModel'] : []),
+      ...(Array.isArray(removeFields) ? removeFields : []),
+    ].filter((field, index, arr) => arr.indexOf(field) === index);
+
+    applyProviderValues(normalizedProvider, nextValues, removeFields);
+    const health = await checkProviderHealth(normalizedProvider, { force: true });
+    pushAIAudit({
+      type: changedFields.includes('apiKey') ? 'credential-replaced' : 'settings-updated',
+      provider: normalizedProvider,
+      actor: user,
+      message: `${user} updated ${AI_PROVIDER_META[normalizedProvider].name} settings`,
+      details: {
+        changedFields,
+        healthy: !!health?.healthy,
+        status: health?.status || 'unknown',
+      },
+    });
+
+    res.json({
+      success: true,
+      message: `${AI_PROVIDER_META[normalizedProvider].name} settings updated`,
+      data: {
+        provider: normalizedProvider,
+        config: getProviderConfig(normalizedProvider),
+        health,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
+});
 
-  if (apiKey !== undefined) {
-    API_KEYS[provider] = apiKey;
-    if (provider === 'openai') LLM_CONFIG.openai.apiKey = apiKey;
-    if (provider === 'anthropic') LLM_CONFIG.anthropic.apiKey = apiKey;
-    if (provider === 'google') LLM_CONFIG.google.apiKey = apiKey;
-    persistKeyToEnv(ENV_VAR_MAP[provider], apiKey);
+app.delete('/api/ai/keys/:provider', requireAuth, async (req, res) => {
+  try {
+    const normalizedProvider = req.params.provider === 'ollama' ? 'local' : req.params.provider;
+    const user = req.user?.username || 'unknown';
+    if (!AI_PROVIDER_META[normalizedProvider]) {
+      return res.status(400).json({ success: false, error: 'Invalid provider' });
+    }
+
+    const removableFields = Object.keys(AI_PROVIDER_META[normalizedProvider].env || {});
+    applyProviderValues(normalizedProvider, {}, removableFields);
+    const health = await checkProviderHealth(normalizedProvider, { force: true });
+
+    if (activeProvider === normalizedProvider) {
+      activeProvider = 'cloud';
+      setEnvValue('DEFAULT_AI_PROVIDER', activeProvider);
+      persistEnvChanges({ DEFAULT_AI_PROVIDER: activeProvider });
+      pushAIAudit({
+        type: 'auto-fallback',
+        provider: activeProvider,
+        actor: 'system',
+        message: `Switched active AI provider from ${normalizedProvider} to ${activeProvider}`,
+        details: {
+          previousProvider: normalizedProvider,
+          nextProvider: activeProvider,
+          reason: 'Active provider credentials were cleared',
+        },
+      });
+    }
+
+    pushAIAudit({
+      type: 'credentials-cleared',
+      provider: normalizedProvider,
+      actor: user,
+      message: `${user} cleared ${AI_PROVIDER_META[normalizedProvider].name} credentials`,
+      details: {
+        clearedFields: removableFields,
+        healthy: !!health?.healthy,
+        status: health?.status || 'unknown',
+      },
+    });
+
+    res.json({
+      success: true,
+      message: `${AI_PROVIDER_META[normalizedProvider].name} credentials cleared`,
+      data: { provider: normalizedProvider, health, activeProvider },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
-
-  if (baseURL !== undefined && provider === 'ollama') {
-    API_KEYS.ollama = baseURL;
-    LLM_CONFIG.local.baseURL = baseURL;
-    persistKeyToEnv('OLLAMA_URL', baseURL);
-  }
-
-  res.json({ success: true, message: `${provider} API key updated and persisted` });
 });
 
 // Get server capabilities for agent delegation
@@ -4150,21 +5141,30 @@ app.post('/api/ai/delegate', requireAuth, async (req, res) => {
   }
 
   try {
+    const anthropic = getProviderConfig('anthropic');
+    if (!anthropic?.apiKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Anthropic credentials are not configured',
+        resolution: 'Add or replace the Anthropic API key in AI Settings',
+      });
+    }
+
     // Use Claude with limited tools
     const tools = SERVER_TOOLS.filter(t => {
       const agentTools = AGENT_PROMPTS[agentId].match(/(\w+)/g);
       return agentTools?.includes(t.name);
     });
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch(`${anthropic.baseURL}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
+        'x-api-key': anthropic.apiKey,
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6-20250514',
+        model: anthropic.defaultModel,
         max_tokens: 4096,
         system: prompt,
         messages: [{ role: 'user', content: task }],
@@ -4202,6 +5202,19 @@ app.use((err, req, res, _next) => {
 process.on('unhandledRejection', (reason) => {
   console.error('[Unhandled Rejection]', reason);
 });
+
+refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: true }).catch((error) => {
+  console.warn('[AI Health] Initial refresh failed:', error.message);
+});
+
+loadAIAlertLog();
+loadAIAuditLog();
+
+setInterval(() => {
+  refreshAIHealth(Object.keys(AI_PROVIDER_META), { force: true }).catch((error) => {
+    console.warn('[AI Health] Scheduled refresh failed:', error.message);
+  });
+}, 60_000);
 
 const PORT = process.env.DASHBOARD_API_PORT || 3999;
 server.listen(PORT, () => {

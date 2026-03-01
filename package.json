@@ -2,10 +2,10 @@
   "name": "deployment-dashboard-server",
   "version": "2.0.0",
   "description": "Enhanced real-time deployment dashboard API server",
-  "main": "enhanced-server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node enhanced-server.js",
-    "dev": "nodemon enhanced-server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "@octokit/rest": "^21.0.0",
