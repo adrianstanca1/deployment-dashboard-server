@@ -2143,20 +2143,73 @@ app.get('/api/system/network', async (req, res) => {
 // Ports in use
 app.get('/api/system/ports', async (req, res) => {
   try {
-    const { stdout } = await execAsync("ss -tlnp | grep LISTEN | awk '{print $4, $6}' | sort -t: -k2 -n");
-    const ports = stdout.trim().split('\n').filter(Boolean).map(line => {
-      const parts = line.trim().split(/\s+/);
-      const addr = parts[0];
-      const proc = parts[1] || '';
-      const portMatch = addr.match(/:(\d+)$/);
-      const port = portMatch ? parseInt(portMatch[1]) : null;
-      const nameMatch = proc.match(/users:\(\("([^"]+)"/);
-      const process = nameMatch ? nameMatch[1] : 'unknown';
-      return { port, address: addr, process };
-    }).filter(p => p.port !== null);
-    res.json({ success: true, data: ports });
+    const { stdout: psOut } = await execAsync('docker ps --format "{{.Names}}|{{.Ports}}|{{.Status}}|{{.Image}}"');
+    let inspectOut = '';
+    try {
+      const idsResult = await execAsync('docker ps -q');
+      const idList = idsResult.stdout.trim().replace(/\n/g, ' ');
+      if (idList) {
+        const r = await execAsync('docker inspect ' + idList + ' --format "{{.Name}}|{{json .Config.Labels}}"');
+        inspectOut = r.stdout;
+      }
+    } catch {}
+
+    const domainMap = {};
+    inspectOut.trim().split('\n').filter(Boolean).forEach(line => {
+      const idx = line.indexOf('|');
+      if (idx === -1) return;
+      const cname = line.slice(0, idx).replace(/^\//, '');
+      try {
+        const labels = JSON.parse(line.slice(idx + 1));
+        for (const [k, v] of Object.entries(labels)) {
+          if (k.includes('.rule') && typeof v === 'string' && v.includes('Host(')) {
+            const m = v.match(/Host\(`([^`]+)`\)/);
+            if (m) domainMap[cname] = m[1];
+          }
+        }
+      } catch {}
+    });
+
+    const ports = [];
+    psOut.trim().split('\n').filter(Boolean).forEach(line => {
+      const parts = line.split('|');
+      const name = parts[0];
+      const portStr = parts[1] || '';
+      const status = parts[2] || '';
+      const image = (parts[3] || '').split(':')[0];
+      if (!portStr) return;
+
+      portStr.split(',').map(s => s.trim()).filter(Boolean).forEach(entry => {
+        let port = null, publicPort = null, protocol = 'tcp';
+        const pubMatch = entry.match(/(\d+)->(\d+)\/(\w+)/);
+        if (pubMatch) {
+          publicPort = parseInt(pubMatch[1]);
+          port = parseInt(pubMatch[2]);
+          protocol = pubMatch[3];
+        } else {
+          const intMatch = entry.match(/(\d+)\/(\w+)/);
+          if (intMatch) { port = parseInt(intMatch[1]); protocol = intMatch[2]; }
+        }
+        if (!port) return;
+        const domain = domainMap[name];
+        const url = domain ? 'https://' + domain : (publicPort ? 'http://72.62.132.43:' + publicPort : null);
+        ports.push({ container: name, image, port, publicPort, protocol,
+          status: status.replace(/^Up /, ''), url, accessible: !!(publicPort || domain) });
+      });
+    });
+
+    // Deduplicate (IPv4/IPv6 produce duplicate entries for same container+port)
+    const seen = new Set();
+    const unique = ports.filter(p => {
+      const key = p.container + ':' + p.port;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    unique.sort((a, b) => (b.accessible ? 1 : 0) - (a.accessible ? 1 : 0) || a.container.localeCompare(b.container));
+    res.json({ success: true, data: unique });
   } catch (error) {
-    res.json({ success: false, error: error.message });
+    res.json({ success: false, error: error.message, data: [] });
   }
 });
 
