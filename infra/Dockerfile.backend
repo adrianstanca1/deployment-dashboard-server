@@ -1,0 +1,18 @@
+# Dashboard Backend — Node.js Express + WebSocket + Docker integration
+FROM node:20-alpine
+WORKDIR /app
+
+# Build tools plus runtime CLIs used by the dashboard backend
+RUN apk add --no-cache curl docker-cli git python3 make g++
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN mkdir -p /app/logs
+
+EXPOSE 3999
+ENV NODE_ENV=production
+ENV PORT=3999
+
+CMD ["node", "server.js"]

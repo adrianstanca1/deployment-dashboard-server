@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./repo-backend
+      dockerfile: ../Dockerfile.backend
+    image: dashboard-backend:latest
+    container_name: dashboard-backend
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/docker/projects:/opt/docker/projects
+      - dashboard_logs:/app/logs
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ./repo-frontend
+      dockerfile: ../Dockerfile.frontend
+    image: dashboard-frontend:latest
+    container_name: dashboard-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - traefik-public
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard-fe.rule=Host(`dashboard.cortexbuildpro.com`)"
+      - "traefik.http.routers.dashboard-fe.entrypoints=websecure"
+      - "traefik.http.routers.dashboard-fe.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dashboard-fe.loadbalancer.server.port=80"
+
+volumes:
+  dashboard_logs:
+
+networks:
+  traefik-public:
+    external: true
+  internal:
+    driver: bridge
