@@ -1,0 +1,19 @@
+{
+  "user": "admin",
+  "password": "admin123",
+  "jwtSecret": "super-secret-jwt-key-deploy-hub-2024",
+  "port": 3999,
+  "cors": {
+    "enabled": true,
+    "origin": "*"
+  },
+  "api": {
+    "prefix": "/api",
+    "rateLimit": 100
+  },
+  "websocket": {
+    "enabled": true,
+    "path": "/ws",
+    "heartbeat": 30000
+  }
+}

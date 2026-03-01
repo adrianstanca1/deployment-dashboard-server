@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+.env
+
+# Git worktrees
+.worktrees/
+.env.production
+.env*
