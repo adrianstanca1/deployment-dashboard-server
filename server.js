@@ -742,8 +742,8 @@ app.get('/api/github/tree/:repo', async (req, res) => {
   try {
     const repo = sanitizeRepoName(req.params.repo);
     const ref = (req.query.ref) || 'HEAD';
-    const commitData = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/git/commits/${ref}`);
-    const treeSha = commitData.tree?.sha;
+    const commitData = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/commits/${ref}`);
+    const treeSha = commitData.commit?.tree?.sha;
     if (!treeSha) throw new Error('Unable to resolve tree');
     const recursive = req.query.recursive !== 'false';
     const tree = await githubFetch(`https://api.github.com/repos/${GITHUB_USERNAME}/${repo}/git/trees/${treeSha}?recursive=${recursive ? 1 : 0}`);
